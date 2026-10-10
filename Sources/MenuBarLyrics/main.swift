@@ -106,6 +106,7 @@ final class MusicReader {
 
     init?() {
         let source = """
+        if application id "com.apple.Music" is not running then return ""
         set sep to ASCII character 31
         tell application "Music"
             try
@@ -131,6 +132,11 @@ final class MusicReader {
     }
 
     func read() throws -> TrackSnapshot? {
+        // AppleScript would launch Music when querying it if it is not running.
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").isEmpty else {
+            return nil
+        }
+
         var errorInfo: NSDictionary?
         let descriptor = script.executeAndReturnError(&errorInfo)
         if let errorInfo {
