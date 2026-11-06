@@ -1,6 +1,11 @@
 import AppKit
 import Foundation
 
+enum PlaybackSource {
+    case system
+    case appleMusic
+}
+
 struct TrackSnapshot: Equatable {
     var state: String
     var position: TimeInterval
@@ -9,6 +14,7 @@ struct TrackSnapshot: Equatable {
     var album: String
     var duration: TimeInterval
     var positionIsReliable: Bool = true
+    var source: PlaybackSource = .system
 
     var isPlaying: Bool {
         state.lowercased() == "playing"
@@ -162,7 +168,8 @@ final class MusicReader {
             name: parts[2],
             artist: parts[3],
             album: parts[4],
-            duration: duration
+            duration: duration,
+            source: .appleMusic
         )
     }
 }
@@ -538,12 +545,17 @@ final class LyricsService {
     }
 }
 
-final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
+final class MenuBarLyricsApp: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let reader = MusicReader()
     private let nowPlayingReader = NowPlayingReader()
     private let lyricsService = LyricsService()
     private let cache = LyricsCache()
+    private let playbackController = PlaybackController()
+    private let floatingPanel = FloatingLyricsPanel()
+    private var floatingMode = UserDefaults.standard.bool(forKey: "floatingLyricsEnabled")
+    private var floatingHidden = UserDefaults.standard.bool(forKey: "floatingLyricsHidden")
+    private var currentTitle = NSAttributedString(string: "♪")
 
     private var currentTrack: TrackSnapshot?
     private var lastPollDate = Date()
@@ -563,14 +575,38 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        floatingPanel.onHide = { [weak self] in self?.toggleFloatingVisibility() }
+        floatingPanel.onCommand = { [weak self] in self?.sendPlaybackCommand($0) }
         configureStatusItem()
+        updatePresentation()
         installMusicNotificationObserver()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityDisplayOptionsChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
         pollMusic()
         startTimers()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        renderTimer?.invalidate()
+        pollTimer?.invalidate()
         DistributedNotificationCenter.default().removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    func applicationDidChangeScreenParameters(_ notification: Notification) {
+        floatingPanel.fitOnScreen()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if floatingMode {
+            floatingHidden = false
+            updatePresentation()
+        }
+        return false
     }
 
     private func configureStatusItem() {
@@ -584,6 +620,23 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "MenuBarLyrics", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(NSMenuItem(title: "Menu Bar Lyrics", action: #selector(useMenuBarLyrics), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Floating Lyrics (Notch-friendly)", action: #selector(useFloatingLyrics), keyEquivalent: ""))
+        let visibility = NSMenuItem(title: "Hide Floating Lyrics", action: #selector(toggleFloatingVisibility), keyEquivalent: "l")
+        visibility.tag = 3001
+        menu.addItem(visibility)
+        let resetPosition = NSMenuItem(title: "Reset Floating Position", action: #selector(resetFloatingPosition), keyEquivalent: "")
+        resetPosition.tag = 3002
+        menu.addItem(resetPosition)
+        menu.addItem(NSMenuItem.separator())
+
+        let playPause = NSMenuItem(title: "Play / Pause", action: #selector(togglePlayback), keyEquivalent: " ")
+        playPause.tag = 4001
+        menu.addItem(playPause)
+        menu.addItem(NSMenuItem(title: "Previous Track", action: #selector(previousTrack), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Next Track", action: #selector(nextTrack), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
 
         let offsetTitle = NSMenuItem(title: offsetText(), action: nil, keyEquivalent: "")
@@ -641,10 +694,16 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
     }
 
     private func pollMusic() {
+        defer {
+            floatingPanel.updatePlayback(currentTrack)
+            refreshMenuTitles()
+        }
         do {
             guard let snapshot = try readPreferredSnapshot() else {
                 currentTrack = nil
                 lyrics = []
+                loadingKey = nil
+                isLoading = false
                 setStatusText("♪", token: "idle")
                 return
             }
@@ -668,6 +727,10 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
                 loadLyrics(for: snapshot)
             }
         } catch {
+            currentTrack = nil
+            lyrics = []
+            isLoading = false
+            loadingKey = nil
             setStatusText("Allow Music Automation", token: "automation-error")
         }
     }
@@ -734,8 +797,9 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
         Task {
             let fetched = await lyricsService.fetchLyrics(for: track)
             await MainActor.run {
+                guard self.currentTrack?.key == key, self.loadingKey == key else { return }
                 self.isLoading = false
-                guard self.currentTrack?.key == key else { return }
+                self.loadingKey = nil
                 self.lyrics = fetched
                 self.cache.save(fetched, for: key)
                 self.lastRenderedToken = ""
@@ -759,6 +823,7 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
 
     private func render() {
         guard let track = currentTrack else { return }
+        guard track.positionIsReliable else { return }
         guard !lyrics.isEmpty else {
             if !isLoading {
                 setStatusText(track.displayName, token: "fallback-\(track.key)")
@@ -769,13 +834,12 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
         let position = estimatedPosition()
         var state = lyricState(at: position)
         stabilizeRenderState(&state, trackKey: track.key)
-        let token = "\(track.key)|\(state.index)|\(state.charIndex)|\(track.isPlaying)|\(offset)|\(maxCharacters)"
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let progressToken = reduceMotion ? 0 : state.charIndex
+        let token = "\(track.key)|\(state.index)|\(progressToken)|\(track.isPlaying)|\(offset)|\(maxCharacters)|\(reduceMotion)"
         guard token != lastRenderedToken else { return }
         lastRenderedToken = token
-        applyTitle(attributedLyric(
-            line: state.line.text,
-            progressCharIndex: state.charIndex
-        ))
+        applyTitle(attributedLyric(line: state.line.text, progressCharIndex: state.charIndex, reduceMotion: reduceMotion))
     }
 
     private func stabilizeRenderState(_ state: inout (line: LyricLine, index: Int, charIndex: Int), trackKey: String) {
@@ -818,7 +882,8 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
         return (line, index, charIndex)
     }
 
-    private func attributedLyric(line: String, progressCharIndex: Int) -> NSAttributedString {
+    func attributedLyric(line: String, progressCharIndex: Int, reduceMotion: Bool) -> NSAttributedString {
+        if reduceMotion { return plainTitle(truncate(line, max: maxCharacters)) }
         let window = visibleWindow(for: line, progressCharIndex: progressCharIndex)
         let visible = Array(window.text)
         let progress = max(0, min(progressCharIndex - window.sourceStart + window.prefixCount, visible.count))
@@ -835,9 +900,10 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
         let restColor = NSColor.white.withAlphaComponent(0.58)
 
         if !visible.isEmpty {
-            result.addAttribute(.foregroundColor, value: restColor, range: NSRange(location: 0, length: visible.count))
+            result.addAttribute(.foregroundColor, value: restColor, range: NSRange(location: 0, length: window.text.utf16.count))
             if progress > 0 {
-                result.addAttribute(.foregroundColor, value: sungColor, range: NSRange(location: 0, length: progress))
+                let sungLength = String(visible.prefix(progress)).utf16.count
+                result.addAttribute(.foregroundColor, value: sungColor, range: NSRange(location: 0, length: sungLength))
             }
         }
 
@@ -887,9 +953,21 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
     }
 
     private func applyTitle(_ title: NSAttributedString) {
-        statusItem.button?.title = title.string
-        statusItem.button?.attributedTitle = title
-        statusItem.length = NSStatusItem.variableLength
+        currentTitle = title
+        floatingPanel.updateTitle(title.string == "♪" ? plainTitle("Start playback in your music player") : title)
+        if floatingMode {
+            statusItem.button?.title = ""
+            statusItem.button?.attributedTitle = NSAttributedString(string: "")
+            statusItem.button?.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: "MenuBarLyrics")
+            statusItem.length = NSStatusItem.squareLength
+        } else {
+            statusItem.button?.image = nil
+            statusItem.button?.title = title.string
+            statusItem.button?.attributedTitle = title
+            statusItem.length = NSStatusItem.variableLength
+        }
+        statusItem.button?.toolTip = "MenuBarLyrics — \(title.string)"
+        statusItem.button?.setAccessibilityLabel("MenuBarLyrics, \(title.string)")
     }
 
     private func truncate(_ text: String, max: Int) -> String {
@@ -908,6 +986,82 @@ final class MenuBarLyricsApp: NSObject, NSApplicationDelegate {
     private func refreshMenuTitles() {
         statusItem.menu?.item(withTag: 1001)?.title = offsetText()
         statusItem.menu?.item(withTag: 2001)?.title = "\(framesPerSecond) FPS"
+        statusItem.menu?.items.forEach { item in
+            if item.action == #selector(useMenuBarLyrics) { item.state = floatingMode ? .off : .on }
+            if item.action == #selector(useFloatingLyrics) { item.state = floatingMode ? .on : .off }
+        }
+        statusItem.menu?.item(withTag: 3001)?.title = floatingHidden ? "Show Floating Lyrics" : "Hide Floating Lyrics"
+        statusItem.menu?.item(withTag: 4001)?.title = currentTrack?.isPlaying == true ? "Pause" : "Play"
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(togglePlayback), #selector(previousTrack), #selector(nextTrack):
+            return currentTrack != nil
+        case #selector(toggleFloatingVisibility), #selector(resetFloatingPosition):
+            return floatingMode
+        default:
+            return menuItem.action != nil
+        }
+    }
+
+    private func updatePresentation() {
+        UserDefaults.standard.set(floatingMode, forKey: "floatingLyricsEnabled")
+        UserDefaults.standard.set(floatingHidden, forKey: "floatingLyricsHidden")
+        applyTitle(currentTitle)
+        if floatingMode && !floatingHidden {
+            floatingPanel.show()
+        } else {
+            floatingPanel.orderOut(nil)
+        }
+        refreshMenuTitles()
+    }
+
+    @objc private func useMenuBarLyrics() {
+        floatingMode = false
+        updatePresentation()
+    }
+
+    @objc private func useFloatingLyrics() {
+        floatingMode = true
+        floatingHidden = false
+        updatePresentation()
+    }
+
+    @objc private func toggleFloatingVisibility() {
+        floatingHidden.toggle()
+        updatePresentation()
+    }
+
+    @objc private func resetFloatingPosition() {
+        floatingPanel.resetPosition()
+        floatingHidden = false
+        updatePresentation()
+    }
+
+    @objc private func accessibilityDisplayOptionsChanged() {
+        lastRenderedToken = ""
+        render()
+    }
+
+    @objc private func togglePlayback() { sendPlaybackCommand(.togglePlayPause) }
+    @objc private func previousTrack() { sendPlaybackCommand(.previous) }
+    @objc private func nextTrack() { sendPlaybackCommand(.next) }
+
+    private func sendPlaybackCommand(_ command: PlaybackCommand) {
+        do {
+            try playbackController.send(command, for: currentTrack)
+            floatingPanel.showMessage(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.pollMusic() }
+        } catch {
+            floatingPanel.showMessage(error.localizedDescription)
+            if !floatingMode {
+                let alert = NSAlert()
+                alert.messageText = "Playback Control Unavailable"
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+            }
+        }
     }
 
     private func offsetText() -> String {
@@ -985,8 +1139,3 @@ private extension String {
             .replacingOccurrences(of: #"[^a-z0-9\u{4e00}-\u{9fff}]"#, with: "", options: .regularExpression)
     }
 }
-
-let app = NSApplication.shared
-let delegate = MenuBarLyricsApp()
-app.delegate = delegate
-app.run()
