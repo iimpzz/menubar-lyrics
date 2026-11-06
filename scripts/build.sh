@@ -11,8 +11,8 @@ mkdir -p "$BUILD_DIR/Contents/MacOS" "$BUILD_DIR/Contents/Resources" "$DIST_DIR"
 cp "$ROOT_DIR/Info.plist" "$BUILD_DIR/Contents/Info.plist"
 cp "$ROOT_DIR/Sources/NowPlayingProbe/main.swift" "$BUILD_DIR/Contents/Resources/NowPlayingProbe.swift"
 
-swiftc -O -framework AppKit \
-  "$ROOT_DIR/Sources/MenuBarLyrics/main.swift" \
+swiftc -O -target "$(uname -m)-apple-macos13.0" -framework AppKit \
+  "$ROOT_DIR"/Sources/MenuBarLyrics/*.swift \
   -o "$BUILD_DIR/Contents/MacOS/MenuBarLyrics"
 
 codesign --force --deep --sign - "$BUILD_DIR"
